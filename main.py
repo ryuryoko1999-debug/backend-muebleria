@@ -41,7 +41,14 @@ class NuevoCliente(BaseModel):
 
 
 def get_connection():
-    return psycopg2.connect(DATABASE_URL)
+    # Fuerza UTF-8 en la sesión para evitar problemas de client encoding
+    # al conectarse a PostgreSQL/Supabase.
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        options="-c client_encoding=UTF8",
+    )
+    conn.set_client_encoding("UTF8")
+    return conn
 
 
 @app.post("/login")
