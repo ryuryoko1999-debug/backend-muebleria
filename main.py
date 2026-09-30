@@ -73,6 +73,14 @@ class PagoCuota(BaseModel):
     fecha_pago: Optional[str] = None
 
 
+class EditarVencimiento(BaseModel):
+    cliente_id: int
+    numero: str
+    detalle_mueble: str
+    vencimiento_actual: str
+    nuevo_vencimiento: str
+
+
 # ============================================================
 # CONEXIÓN A SUPABASE / POSTGRESQL
 # ============================================================
@@ -811,6 +819,99 @@ def marcar_cuota_pagada(
             detail=f"No se pudo marcar la cuota como pagada: {str(exc)}",
         )
 
+    finally:
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# ADMIN - EDITAR FECHA DE VENCIMIENTO
+# ============================================================
+
+@app.put("/admin/cuota/editar-vencimiento")
+def editar_vencimiento(
+    datos: EditarVencimiento,
+    authorization: str | None = Header(default=None),
+):
+    comprobar_admin_token(authorization)
+
+    nuevo = datos.nuevo_vencimiento.strip()
+    actual = datos.vencimiento_actual.strip()
+
+    if not nuevo:
+        raise HTTPException(status_code=400, detail="La nueva fecha es obligatoria.")
+
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM cuotas
+                WHERE cliente_id = %s
+                  AND numero = %s
+                  AND detalle_mueble = %s
+                  AND vencimiento = %s
+                """,
+                (
+                    datos.cliente_id,
+                    datos.numero.strip(),
+                    datos.detalle_mueble.strip(),
+                    actual,
+                ),
+            )
+
+            cantidad = cur.fetchone()[0]
+
+            if cantidad == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No se encontró la cuota con esa fecha de vencimiento.",
+                )
+
+            if cantidad > 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Hay más de una cuota que coincide con esos datos. No se modificó ninguna.",
+                )
+
+            cur.execute(
+                """
+                UPDATE cuotas
+                SET vencimiento = %s
+                WHERE cliente_id = %s
+                  AND numero = %s
+                  AND detalle_mueble = %s
+                  AND vencimiento = %s
+                """,
+                (
+                    nuevo,
+                    datos.cliente_id,
+                    datos.numero.strip(),
+                    datos.detalle_mueble.strip(),
+                    actual,
+                ),
+            )
+
+        conn.commit()
+        return {
+            "ok": True,
+            "mensaje": "Fecha de vencimiento actualizada correctamente.",
+            "nuevo_vencimiento": nuevo,
+        }
+
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as exc:
+        if conn:
+            conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"No se pudo actualizar la fecha: {str(exc)}",
+        )
     finally:
         if conn:
             conn.close()
