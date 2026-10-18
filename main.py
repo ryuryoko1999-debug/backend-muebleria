@@ -1,5 +1,5 @@
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Optional
 
 import psycopg
@@ -71,17 +71,6 @@ class PagoCuota(BaseModel):
     detalle_mueble: str
     vencimiento: str
     fecha_pago: Optional[str] = None
-
-
-class AbonoCuota(BaseModel):
-    cliente_id: int
-    numero: str
-    detalle_mueble: str
-    vencimiento: str
-    monto_abono: float = Field(gt=0)
-    fecha_pago: Optional[str] = None
-    aplicar_recargo: bool = False
-    dias_gracia: int = Field(default=0, ge=0, le=90)
 
 
 class EditarVencimiento(BaseModel):
@@ -458,35 +447,31 @@ def eliminar_cliente(
         conn = get_connection()
 
         with conn.cursor() as cur:
+            # Verificamos que exista el cliente y bloqueamos la fila durante la operación.
             cur.execute(
-                """
-                SELECT COUNT(*)
-                FROM cuotas
-                WHERE cliente_id = %s
-                """,
+                "SELECT id FROM clientes WHERE id = %s FOR UPDATE",
                 (cliente_id_int,),
             )
+            cliente = cur.fetchone()
 
-            cantidad_cuotas = cur.fetchone()[0]
-
-            if cantidad_cuotas > 0:
+            if not cliente:
                 raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "No se puede eliminar este cliente porque tiene "
-                        f"{cantidad_cuotas} cuota(s) asociada(s)."
-                    ),
+                    status_code=404,
+                    detail="Cliente no encontrado.",
                 )
 
+            # Borramos las cuotas y el cliente dentro de la misma transacción.
+            # Si ocurre un error, el rollback evita que quede una eliminación parcial.
             cur.execute(
-                """
-                DELETE FROM clientes
-                WHERE id = %s
-                RETURNING id
-                """,
+                "DELETE FROM cuotas WHERE cliente_id = %s",
                 (cliente_id_int,),
             )
+            cuotas_eliminadas = cur.rowcount
 
+            cur.execute(
+                "DELETE FROM clientes WHERE id = %s RETURNING id",
+                (cliente_id_int,),
+            )
             eliminado = cur.fetchone()
 
             if not eliminado:
@@ -499,7 +484,8 @@ def eliminar_cliente(
 
         return {
             "ok": True,
-            "mensaje": "Cliente eliminado correctamente",
+            "mensaje": "Cliente y cuotas asociadas eliminados correctamente",
+            "cuotas_eliminadas": cuotas_eliminadas,
         }
 
     except HTTPException:
@@ -521,34 +507,6 @@ def eliminar_cliente(
             conn.close()
 
 
-def fecha_fin_gracia_habil(vencimiento: date, dias_gracia: int) -> date:
-    """Devuelve el último día de gracia, contando solo lunes a viernes posteriores al vencimiento."""
-    actual = vencimiento
-    contados = 0
-    while contados < dias_gracia:
-        actual += timedelta(days=1)
-        if actual.weekday() < 5:
-            contados += 1
-    return actual
-
-
-def asegurar_tabla_pagos(cur):
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS pagos_cuotas (
-            id BIGSERIAL PRIMARY KEY,
-            cliente_id BIGINT NOT NULL,
-            numero TEXT NOT NULL,
-            detalle_mueble TEXT NOT NULL,
-            vencimiento TEXT NOT NULL,
-            monto_aplicado NUMERIC(14,2) NOT NULL,
-            recargo_monto NUMERIC(14,2) NOT NULL DEFAULT 0,
-            fecha_pago TEXT NOT NULL,
-            aplicar_recargo BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)
-
-
 # ============================================================
 # ADMIN - CUOTAS DE UN CLIENTE
 # ============================================================
@@ -559,43 +517,54 @@ def listar_cuotas_cliente(
     authorization: str | None = Header(default=None),
 ):
     comprobar_admin_token(authorization)
+
     conn = None
+
     try:
         conn = get_connection()
+
         with conn.cursor() as cur:
-            asegurar_tabla_pagos(cur)
-            cur.execute("ALTER TABLE cuotas ADD COLUMN IF NOT EXISTS dias_gracia INTEGER NOT NULL DEFAULT 0")
-            cur.execute("""
-                SELECT q.cliente_id, q.nombre, q.detalle_mueble, q.mes, q.numero,
-                       q.vencimiento, q.monto, q.estado, q.fecha_pago, COALESCE(q.dias_gracia,0),
-                       COALESCE(p.total_abonado,0), COALESCE(p.total_recargo,0), COALESCE(p.cantidad_pagos,0), p.ultimo_pago
-                FROM cuotas q
-                LEFT JOIN (
-                    SELECT cliente_id, numero, detalle_mueble, vencimiento,
-                           SUM(monto_aplicado) AS total_abonado,
-                           SUM(recargo_monto) AS total_recargo,
-                           COUNT(*) AS cantidad_pagos,
-                           MAX(fecha_pago) AS ultimo_pago
-                    FROM pagos_cuotas
-                    GROUP BY cliente_id, numero, detalle_mueble, vencimiento
-                ) p ON p.cliente_id=q.cliente_id AND p.numero=q.numero
-                    AND p.detalle_mueble=q.detalle_mueble AND p.vencimiento=q.vencimiento::text
-                WHERE q.cliente_id = %s
-                ORDER BY q.detalle_mueble, q.numero
-            """, (cliente_id,))
+            cur.execute(
+                """
+                SELECT
+                    cliente_id,
+                    nombre,
+                    detalle_mueble,
+                    mes,
+                    numero,
+                    vencimiento,
+                    monto,
+                    estado,
+                    fecha_pago
+                FROM cuotas
+                WHERE cliente_id = %s
+                ORDER BY detalle_mueble, numero
+                """,
+                (cliente_id,),
+            )
+
             filas = cur.fetchall()
-        conn.commit()  # Persiste la creación inicial de pagos_cuotas y dias_gracia.
-        return [{
-            "cliente_id": row[0], "nombre": row[1], "detalle_mueble": row[2], "mes": row[3],
-            "numero": row[4], "vencimiento": formatear_fecha(row[5]), "monto": float(row[6] or 0),
-            "estado": row[7], "fecha_pago": formatear_fecha(row[8]), "dias_gracia": int(row[9] or 0),
-            "monto_abonado": (float(row[10] or 0) if float(row[10] or 0) > 0 else (float(row[6] or 0) if str(row[7] or "").strip().lower() == "pagado" else 0)),
-            "recargo_abonado": float(row[11] or 0), "cantidad_pagos": int(row[12] or 0),
-            "ultimo_abono": formatear_fecha(row[13]),
-            "saldo_pendiente": 0 if str(row[7] or "").strip().lower() == "pagado" else max(0, float(row[6] or 0)-float(row[10] or 0))
-        } for row in filas]
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"No se pudieron obtener las cuotas: {str(exc)}")
+
+        return [
+            {
+                "cliente_id": row[0],
+                "nombre": row[1],
+                "detalle_mueble": row[2],
+                "mes": row[3],
+                "numero": row[4],
+                "vencimiento": formatear_fecha(row[5]),
+                "monto": int(row[6]) if row[6] is not None else 0,
+                "estado": row[7],
+                "fecha_pago": formatear_fecha(row[8]),
+            }
+            for row in filas
+        ]
+
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="No se pudieron obtener las cuotas.",
+        )
     finally:
         if conn:
             conn.close()
@@ -946,98 +915,6 @@ def editar_vencimiento(
 
 
 # ============================================================
-# ADMIN - REGISTRAR ABONOS PARCIALES / TOTALES
-# ============================================================
-
-@app.post("/admin/cuota/abono")
-def registrar_abono_cuota(datos: AbonoCuota, authorization: str | None = Header(default=None)):
-    comprobar_admin_token(authorization)
-    fecha_pago = (datos.fecha_pago or date.today().strftime("%d/%m/%Y")).strip()
-    conn = None
-    try:
-        conn = get_connection()
-        with conn.cursor() as cur:
-            asegurar_tabla_pagos(cur)
-            cur.execute("ALTER TABLE cuotas ADD COLUMN IF NOT EXISTS dias_gracia INTEGER NOT NULL DEFAULT 0")
-            cur.execute("""SELECT monto, estado, COALESCE(dias_gracia,0) FROM cuotas
-                WHERE cliente_id=%s AND numero=%s AND detalle_mueble=%s AND vencimiento::text=%s FOR UPDATE""",
-                (datos.cliente_id, datos.numero.strip(), datos.detalle_mueble.strip(), datos.vencimiento.strip()))
-            filas = cur.fetchall()
-            if len(filas) == 0:
-                raise HTTPException(status_code=404, detail="No se encontró la cuota indicada.")
-            if len(filas) > 1:
-                raise HTTPException(status_code=409, detail="Hay más de una cuota coincidente; no se registró el abono.")
-            monto_cuota, estado, gracia_actual = filas[0]
-            if str(estado or '').strip().lower() == 'pagado':
-                raise HTTPException(status_code=409, detail="Esta cuota ya está pagada.")
-            cur.execute("""SELECT COALESCE(SUM(monto_aplicado),0) FROM pagos_cuotas
-                WHERE cliente_id=%s AND numero=%s AND detalle_mueble=%s AND vencimiento=%s""",
-                (datos.cliente_id, datos.numero.strip(), datos.detalle_mueble.strip(), datos.vencimiento.strip()))
-            abonado_previo = float(cur.fetchone()[0] or 0)
-            saldo = max(0.0, float(monto_cuota or 0)-abonado_previo)
-            principal = round(float(datos.monto_abono), 2)
-            if principal > saldo + 0.01:
-                raise HTTPException(status_code=400, detail=f"El abono supera el saldo pendiente ({saldo:.2f}).")
-            cur.execute("UPDATE cuotas SET dias_gracia=%s WHERE cliente_id=%s AND numero=%s AND detalle_mueble=%s AND vencimiento::text=%s",
-                (datos.dias_gracia, datos.cliente_id, datos.numero.strip(), datos.detalle_mueble.strip(), datos.vencimiento.strip()))
-            try:
-                venc = parsear_fecha(datos.vencimiento)
-                hoy = date.today()
-                fin_gracia = fecha_fin_gracia_habil(venc, datos.dias_gracia)
-                dias_atraso = max(0, (hoy - fin_gracia).days)
-            except Exception:
-                dias_atraso = 0
-            recargo = round(saldo * 0.01 * dias_atraso, 2) if datos.aplicar_recargo else 0.0
-            cur.execute("""INSERT INTO pagos_cuotas
-                (cliente_id, numero, detalle_mueble, vencimiento, monto_aplicado, recargo_monto, fecha_pago, aplicar_recargo)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (datos.cliente_id, datos.numero.strip(), datos.detalle_mueble.strip(), datos.vencimiento.strip(), principal, recargo, fecha_pago, datos.aplicar_recargo))
-            abonado_total = round(abonado_previo + principal, 2)
-            pagada = abonado_total >= float(monto_cuota or 0) - 0.01
-            if pagada:
-                cur.execute("UPDATE cuotas SET estado='pagado', fecha_pago=%s WHERE cliente_id=%s AND numero=%s AND detalle_mueble=%s AND vencimiento::text=%s",
-                    (fecha_pago, datos.cliente_id, datos.numero.strip(), datos.detalle_mueble.strip(), datos.vencimiento.strip()))
-            else:
-                cur.execute("UPDATE cuotas SET estado='Pendiente', fecha_pago=NULL WHERE cliente_id=%s AND numero=%s AND detalle_mueble=%s AND vencimiento::text=%s",
-                    (datos.cliente_id, datos.numero.strip(), datos.detalle_mueble.strip(), datos.vencimiento.strip()))
-        conn.commit()
-        return {"ok": True, "estado": "pagado" if pagada else "parcial", "monto_cuota": float(monto_cuota or 0),
-                "abonado_acumulado": abonado_total, "saldo_pendiente": max(0, float(monto_cuota or 0)-abonado_total),
-                "monto_abono": principal, "recargo": recargo, "total_recibido": round(principal+recargo,2),
-                "fecha_pago": fecha_pago, "mensaje": "Cuota pagada." if pagada else "Abono parcial registrado; la cuota continúa pendiente."}
-    except HTTPException:
-        if conn: conn.rollback()
-        raise
-    except Exception as exc:
-        if conn: conn.rollback()
-        raise HTTPException(status_code=500, detail=f"No se pudo registrar el abono: {str(exc)}")
-    finally:
-        if conn: conn.close()
-
-
-@app.get("/admin/reportes/datos")
-def datos_reportes(authorization: str | None = Header(default=None)):
-    comprobar_admin_token(authorization)
-    conn = None
-    try:
-        conn = get_connection()
-        with conn.cursor() as cur:
-            asegurar_tabla_pagos(cur)
-            cur.execute("SELECT id, nombre FROM clientes ORDER BY nombre")
-            clientes = [{"id": r[0], "nombre": r[1]} for r in cur.fetchall()]
-            cur.execute("""SELECT cliente_id, numero, detalle_mueble, vencimiento, monto_aplicado,
-                recargo_monto, fecha_pago, aplicar_recargo, created_at FROM pagos_cuotas ORDER BY created_at""")
-            pagos = [{"cliente_id":r[0],"numero":r[1],"detalle_mueble":r[2],"vencimiento":r[3],"monto":float(r[4] or 0),
-                "recargo":float(r[5] or 0),"fecha_pago":r[6],"aplicar_recargo":r[7],"created_at":r[8].isoformat() if r[8] else None} for r in cur.fetchall()]
-        conn.commit()
-        return {"clientes":clientes,"pagos":pagos}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"No se pudieron cargar los datos del reporte: {str(exc)}")
-    finally:
-        if conn: conn.close()
-
-
-# ============================================================
 # SALUD DE LA API
 # ============================================================
 
@@ -1172,7 +1049,6 @@ class EditarCuota(BaseModel):
     nuevo_monto: Optional[int] = Field(default=None, gt=0)
     nuevo_detalle_mueble: Optional[str] = None
     nuevo_vencimiento: Optional[str] = None
-    nuevo_dias_gracia: Optional[int] = Field(default=None, ge=0, le=90)
 
 
 @app.put("/admin/cuota/editar")
@@ -1181,7 +1057,7 @@ def editar_cuota(
     authorization: str | None = Header(default=None),
 ):
     comprobar_admin_token(authorization)
-    if datos.nuevo_monto is None and datos.nuevo_detalle_mueble is None and datos.nuevo_vencimiento is None and datos.nuevo_dias_gracia is None:
+    if datos.nuevo_monto is None and datos.nuevo_detalle_mueble is None and datos.nuevo_vencimiento is None:
         raise HTTPException(status_code=400, detail="No se indicó ningún cambio.")
     if datos.nuevo_detalle_mueble is not None and not datos.nuevo_detalle_mueble.strip():
         raise HTTPException(status_code=400, detail="El detalle del mueble no puede quedar vacío.")
@@ -1190,7 +1066,6 @@ def editar_cuota(
     try:
         conn = get_connection()
         with conn.cursor() as cur:
-            cur.execute("ALTER TABLE cuotas ADD COLUMN IF NOT EXISTS dias_gracia INTEGER NOT NULL DEFAULT 0")
             cur.execute(
                 """
                 SELECT estado FROM cuotas
@@ -1205,18 +1080,6 @@ def editar_cuota(
                 raise HTTPException(status_code=404, detail="No se encontró la cuota indicada.")
             if len(filas) > 1:
                 raise HTTPException(status_code=409, detail="La cuota no es única; no se modificó nada.")
-
-            asegurar_tabla_pagos(cur)
-            cur.execute("""SELECT COALESCE(SUM(monto_aplicado),0) FROM pagos_cuotas
-                WHERE cliente_id=%s AND numero=%s AND detalle_mueble=%s AND vencimiento=%s""",
-                (datos.cliente_id, datos.numero.strip(), datos.detalle_mueble_actual.strip(), datos.vencimiento_actual.strip()))
-            abonado = float(cur.fetchone()[0] or 0)
-            cambia_clave = ((datos.nuevo_detalle_mueble is not None and datos.nuevo_detalle_mueble.strip() != datos.detalle_mueble_actual.strip()) or
-                            (datos.nuevo_vencimiento is not None and datos.nuevo_vencimiento.strip() != datos.vencimiento_actual.strip()))
-            if abonado > 0 and cambia_clave:
-                raise HTTPException(status_code=409, detail="Esta cuota ya tiene abonos registrados. Para conservar el historial, no cambies el mueble ni el vencimiento; podés editar el importe si no queda por debajo de lo abonado.")
-            if datos.nuevo_monto is not None and datos.nuevo_monto < abonado:
-                raise HTTPException(status_code=400, detail=f"El nuevo importe no puede ser menor a lo ya abonado ({abonado:.2f}).")
 
             nuevo_detalle = (
                 datos.nuevo_detalle_mueble.strip()
@@ -1242,9 +1105,6 @@ def editar_cuota(
             if datos.nuevo_vencimiento is not None:
                 campos.append("vencimiento = %s")
                 valores.append(nuevo_vencimiento)
-            if datos.nuevo_dias_gracia is not None:
-                campos.append("dias_gracia = %s")
-                valores.append(datos.nuevo_dias_gracia)
 
             valores.extend([
                 datos.cliente_id, datos.numero.strip(),
@@ -1317,11 +1177,6 @@ def editar_venta(
                     status_code=409,
                     detail="Esta venta tiene cuotas pagadas. Para proteger el historial, no se puede recalcular completa; editá solo las cuotas pendientes.",
                 )
-            asegurar_tabla_pagos(cur)
-            cur.execute("SELECT COUNT(*) FROM pagos_cuotas WHERE cliente_id=%s AND detalle_mueble=%s",
-                        (venta.cliente_id, venta.detalle_mueble_actual.strip()))
-            if int(cur.fetchone()[0] or 0) > 0:
-                raise HTTPException(status_code=409, detail="Esta venta ya tiene abonos registrados. Para conservar el historial, no se puede recalcular completa; editá las cuotas pendientes individualmente.")
 
             cur.execute(
                 "DELETE FROM cuotas WHERE cliente_id = %s AND detalle_mueble = %s",
