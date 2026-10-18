@@ -954,3 +954,276 @@ def health():
     finally:
         if conn:
             conn.close()
+
+
+
+# ============================================================
+# ADMIN - EDITAR DATOS DE CLIENTE
+# ============================================================
+
+class EditarCliente(BaseModel):
+    nombre: Optional[str] = None
+    contrasena: Optional[str] = None
+
+    @field_validator("nombre")
+    @classmethod
+    def limpiar_nombre(cls, value):
+        return value.strip() if value is not None else value
+
+
+@app.put("/admin/clientes/{cliente_id}")
+def editar_cliente(
+    cliente_id: str,
+    datos: EditarCliente,
+    authorization: str | None = Header(default=None),
+):
+    comprobar_admin_token(authorization)
+    try:
+        cliente_id_int = int(cliente_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="El ID del cliente debe ser numérico.")
+
+    if datos.nombre is None and datos.contrasena is None:
+        raise HTTPException(status_code=400, detail="Indicá el nombre o la contraseña a modificar.")
+    if datos.nombre is not None and not datos.nombre:
+        raise HTTPException(status_code=400, detail="El nombre no puede quedar vacío.")
+
+    nueva_contrasena = (
+        contraseña_numerica(datos.contrasena)
+        if datos.contrasena is not None and datos.contrasena.strip()
+        else None
+    )
+    if datos.contrasena is not None and not datos.contrasena.strip():
+        raise HTTPException(status_code=400, detail="La contraseña no puede quedar vacía.")
+
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM clientes WHERE id = %s", (cliente_id_int,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Cliente no encontrado.")
+
+            if datos.nombre is not None and nueva_contrasena is not None:
+                cur.execute(
+                    "UPDATE clientes SET nombre = %s, contrasena = %s WHERE id = %s",
+                    (datos.nombre, nueva_contrasena, cliente_id_int),
+                )
+            elif datos.nombre is not None:
+                cur.execute(
+                    "UPDATE clientes SET nombre = %s WHERE id = %s",
+                    (datos.nombre, cliente_id_int),
+                )
+            else:
+                cur.execute(
+                    "UPDATE clientes SET contrasena = %s WHERE id = %s",
+                    (nueva_contrasena, cliente_id_int),
+                )
+
+            if datos.nombre is not None:
+                cur.execute(
+                    "UPDATE cuotas SET nombre = %s WHERE cliente_id = %s",
+                    (datos.nombre, cliente_id_int),
+                )
+        conn.commit()
+        return {"ok": True, "mensaje": "Datos del cliente actualizados."}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail="No se pudieron actualizar los datos del cliente.")
+    finally:
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# ADMIN - EDITAR UNA CUOTA (MONTO, MUEBLE Y VENCIMIENTO)
+# ============================================================
+
+class EditarCuota(BaseModel):
+    cliente_id: int
+    numero: str
+    detalle_mueble_actual: str
+    vencimiento_actual: str
+    nuevo_monto: Optional[int] = Field(default=None, gt=0)
+    nuevo_detalle_mueble: Optional[str] = None
+    nuevo_vencimiento: Optional[str] = None
+
+
+@app.put("/admin/cuota/editar")
+def editar_cuota(
+    datos: EditarCuota,
+    authorization: str | None = Header(default=None),
+):
+    comprobar_admin_token(authorization)
+    if datos.nuevo_monto is None and datos.nuevo_detalle_mueble is None and datos.nuevo_vencimiento is None:
+        raise HTTPException(status_code=400, detail="No se indicó ningún cambio.")
+    if datos.nuevo_detalle_mueble is not None and not datos.nuevo_detalle_mueble.strip():
+        raise HTTPException(status_code=400, detail="El detalle del mueble no puede quedar vacío.")
+
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT estado FROM cuotas
+                WHERE cliente_id = %s AND numero = %s
+                  AND detalle_mueble = %s AND vencimiento = %s
+                """,
+                (datos.cliente_id, datos.numero.strip(), datos.detalle_mueble_actual.strip(),
+                 datos.vencimiento_actual.strip()),
+            )
+            filas = cur.fetchall()
+            if not filas:
+                raise HTTPException(status_code=404, detail="No se encontró la cuota indicada.")
+            if len(filas) > 1:
+                raise HTTPException(status_code=409, detail="La cuota no es única; no se modificó nada.")
+
+            nuevo_detalle = (
+                datos.nuevo_detalle_mueble.strip()
+                if datos.nuevo_detalle_mueble is not None
+                else datos.detalle_mueble_actual.strip()
+            )
+            nuevo_vencimiento = (
+                datos.nuevo_vencimiento.strip()
+                if datos.nuevo_vencimiento is not None
+                else datos.vencimiento_actual.strip()
+            )
+            if datos.nuevo_vencimiento is not None:
+                parsear_fecha(datos.nuevo_vencimiento)
+
+            campos = []
+            valores = []
+            if datos.nuevo_monto is not None:
+                campos.append("monto = %s")
+                valores.append(datos.nuevo_monto)
+            if datos.nuevo_detalle_mueble is not None:
+                campos.append("detalle_mueble = %s")
+                valores.append(nuevo_detalle)
+            if datos.nuevo_vencimiento is not None:
+                campos.append("vencimiento = %s")
+                valores.append(nuevo_vencimiento)
+
+            valores.extend([
+                datos.cliente_id, datos.numero.strip(),
+                datos.detalle_mueble_actual.strip(), datos.vencimiento_actual.strip()
+            ])
+            cur.execute(
+                f"""UPDATE cuotas SET {', '.join(campos)}
+                    WHERE cliente_id = %s AND numero = %s
+                      AND detalle_mueble = %s AND vencimiento = %s""",
+                tuple(valores),
+            )
+        conn.commit()
+        return {"ok": True, "mensaje": "Cuota actualizada correctamente."}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail="No se pudo actualizar la cuota.")
+    finally:
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# ADMIN - MODIFICAR CANTIDAD DE CUOTAS DE UNA VENTA
+# Solo permite recalcular ventas sin cuotas pagadas para proteger el historial.
+# ============================================================
+
+class EditarVenta(BaseModel):
+    cliente_id: int
+    detalle_mueble_actual: str
+    nuevo_detalle_mueble: str = Field(min_length=1)
+    monto_total: int = Field(gt=0)
+    cantidad_cuotas: int = Field(gt=0, le=120)
+    primer_vencimiento: str
+
+
+@app.put("/admin/ventas/editar")
+def editar_venta(
+    venta: EditarVenta,
+    authorization: str | None = Header(default=None),
+):
+    comprobar_admin_token(authorization)
+    primer_vencimiento = parsear_fecha(venta.primer_vencimiento)
+    nuevo_detalle = venta.nuevo_detalle_mueble.strip()
+    if not nuevo_detalle:
+        raise HTTPException(status_code=400, detail="El detalle del mueble es obligatorio.")
+
+    conn = None
+    try:
+        import calendar
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT estado, numero FROM cuotas
+                WHERE cliente_id = %s AND detalle_mueble = %s
+                ORDER BY numero
+                """,
+                (venta.cliente_id, venta.detalle_mueble_actual.strip()),
+            )
+            filas = cur.fetchall()
+            if not filas:
+                raise HTTPException(status_code=404, detail="No se encontró la venta indicada.")
+            if any(str(f[0]).strip().lower() in ("pagado", "pago", "paid") for f in filas):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Esta venta tiene cuotas pagadas. Para proteger el historial, no se puede recalcular completa; editá solo las cuotas pendientes.",
+                )
+
+            cur.execute(
+                "DELETE FROM cuotas WHERE cliente_id = %s AND detalle_mueble = %s",
+                (venta.cliente_id, venta.detalle_mueble_actual.strip()),
+            )
+            cur.execute("SELECT nombre FROM clientes WHERE id = %s", (venta.cliente_id,))
+            cliente = cur.fetchone()
+            if not cliente:
+                raise HTTPException(status_code=404, detail="Cliente no encontrado.")
+
+            base = venta.monto_total // venta.cantidad_cuotas
+            resto = venta.monto_total % venta.cantidad_cuotas
+            for i in range(venta.cantidad_cuotas):
+                nro = i + 1
+                monto = base + (resto if nro == venta.cantidad_cuotas else 0)
+                fecha_texto = primer_vencimiento.strftime("%d/%m/%Y")
+                mes = MESES[primer_vencimiento.month - 1]
+                cur.execute(
+                    """
+                    INSERT INTO cuotas
+                    (cliente_id, nombre, detalle_mueble, mes, numero, vencimiento, monto, estado, fecha_pago)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (venta.cliente_id, cliente[0], nuevo_detalle, mes,
+                     f"{nro} de {venta.cantidad_cuotas}", fecha_texto, monto, "Pendiente", None),
+                )
+                mes_nuevo = primer_vencimiento.month + 1
+                anio_nuevo = primer_vencimiento.year
+                if mes_nuevo > 12:
+                    mes_nuevo = 1
+                    anio_nuevo += 1
+                dia = min(primer_vencimiento.day, calendar.monthrange(anio_nuevo, mes_nuevo)[1])
+                primer_vencimiento = date(anio_nuevo, mes_nuevo, dia)
+
+        conn.commit()
+        return {"ok": True, "mensaje": "Venta actualizada correctamente."}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail="No se pudo actualizar la venta.")
+    finally:
+        if conn:
+            conn.close()
