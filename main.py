@@ -75,6 +75,17 @@ class PagoCuota(BaseModel):
 
 
 
+class AbonoCuota(BaseModel):
+    cliente_id: int
+    numero: str
+    detalle_mueble: str
+    vencimiento: str
+    monto_abono: float = Field(gt=0)
+    fecha_pago: Optional[str] = None
+    aplicar_recargo: bool = False
+    dias_gracia: int = Field(default=0, ge=0)
+
+
 class EditarFechaPago(BaseModel):
     cliente_id: int
     numero: str
@@ -533,6 +544,17 @@ def listar_cuotas_cliente(
         conn = get_connection()
 
         with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS pagos_cuotas (
+                id BIGSERIAL PRIMARY KEY,
+                cliente_id BIGINT NOT NULL,
+                numero TEXT NOT NULL,
+                detalle_mueble TEXT NOT NULL,
+                vencimiento TEXT NOT NULL,
+                monto_abono NUMERIC(14,2) NOT NULL,
+                recargo NUMERIC(14,2) NOT NULL DEFAULT 0,
+                fecha_pago TEXT NOT NULL,
+                creado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
             cur.execute(
                 """
                 SELECT
@@ -544,7 +566,10 @@ def listar_cuotas_cliente(
                     vencimiento,
                     monto,
                     estado,
-                    fecha_pago
+                    fecha_pago,
+                    COALESCE((SELECT SUM(p.monto_abono) FROM pagos_cuotas p
+                        WHERE p.cliente_id = cuotas.cliente_id AND p.numero = cuotas.numero
+                        AND p.detalle_mueble = cuotas.detalle_mueble AND p.vencimiento = cuotas.vencimiento), 0) AS monto_abonado
                 FROM cuotas
                 WHERE cliente_id = %s
                 ORDER BY detalle_mueble, numero
@@ -565,6 +590,8 @@ def listar_cuotas_cliente(
                 "monto": int(row[6]) if row[6] is not None else 0,
                 "estado": row[7],
                 "fecha_pago": formatear_fecha(row[8]),
+                "monto_abonado": float(row[9] or 0),
+                "saldo_pendiente": max(0, float(row[6] or 0) - float(row[9] or 0)),
             }
             for row in filas
         ]
@@ -730,6 +757,77 @@ def crear_venta(
 # ============================================================
 # ADMIN - MARCAR UNA CUOTA COMO PAGADA
 # ============================================================
+
+@app.post("/admin/cuota/abono")
+def registrar_abono_cuota(
+    datos: AbonoCuota,
+    authorization: str | None = Header(default=None),
+):
+    """Registra un pago total o parcial y conserva su historial."""
+    comprobar_admin_token(authorization)
+    try:
+        fecha_obj = parsear_fecha(datos.fecha_pago) if datos.fecha_pago else date.today()
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="La fecha del pago no es válida.")
+    fecha_texto = fecha_obj.strftime("%d/%m/%Y")
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS pagos_cuotas (
+                id BIGSERIAL PRIMARY KEY,
+                cliente_id BIGINT NOT NULL,
+                numero TEXT NOT NULL,
+                detalle_mueble TEXT NOT NULL,
+                vencimiento TEXT NOT NULL,
+                monto_abono NUMERIC(14,2) NOT NULL,
+                recargo NUMERIC(14,2) NOT NULL DEFAULT 0,
+                fecha_pago TEXT NOT NULL,
+                creado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
+            cur.execute("""SELECT monto, estado FROM cuotas
+                WHERE cliente_id = %s AND numero = %s AND detalle_mueble = %s AND vencimiento = %s
+                FOR UPDATE""", (datos.cliente_id, datos.numero.strip(), datos.detalle_mueble.strip(), datos.vencimiento.strip()))
+            filas = cur.fetchall()
+            if not filas:
+                raise HTTPException(status_code=404, detail="No se encontró la cuota indicada.")
+            if len(filas) != 1:
+                raise HTTPException(status_code=409, detail="Hay más de una cuota que coincide. No se registró el pago.")
+            monto_base = float(filas[0][0] or 0)
+            cur.execute("""SELECT COALESCE(SUM(monto_abono), 0) FROM pagos_cuotas
+                WHERE cliente_id = %s AND numero = %s AND detalle_mueble = %s AND vencimiento = %s""",
+                (datos.cliente_id, datos.numero.strip(), datos.detalle_mueble.strip(), datos.vencimiento.strip()))
+            abonado = float(cur.fetchone()[0] or 0)
+            saldo = max(0, monto_base - abonado)
+            amount = round(float(datos.monto_abono), 2)
+            if amount <= 0 or amount > saldo + 0.01:
+                raise HTTPException(status_code=400, detail=f"El abono debe ser mayor a cero y no superar el saldo {saldo:.2f}.")
+            vencimiento_obj = parsear_fecha(datos.vencimiento)
+            dias_atraso = max(0, (fecha_obj - vencimiento_obj).days - datos.dias_gracia)
+            recargo = round(saldo * 0.01 * dias_atraso, 2) if datos.aplicar_recargo else 0.0
+            cur.execute("""INSERT INTO pagos_cuotas
+                (cliente_id, numero, detalle_mueble, vencimiento, monto_abono, recargo, fecha_pago)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (datos.cliente_id, datos.numero.strip(), datos.detalle_mueble.strip(), datos.vencimiento.strip(), amount, recargo, fecha_texto))
+            nuevo_abonado = round(abonado + amount, 2)
+            nuevo_saldo = max(0, round(monto_base - nuevo_abonado, 2))
+            estado = "Pagado" if nuevo_saldo <= 0.01 else "Pendiente"
+            cur.execute("""UPDATE cuotas SET estado = %s, fecha_pago = %s
+                WHERE cliente_id = %s AND numero = %s AND detalle_mueble = %s AND vencimiento = %s""",
+                (estado, fecha_texto if estado == "Pagado" else None, datos.cliente_id, datos.numero.strip(), datos.detalle_mueble.strip(), datos.vencimiento.strip()))
+        conn.commit()
+        return {"ok": True, "mensaje": "Pago registrado correctamente.", "fecha_pago": fecha_texto,
+            "monto_abonado": nuevo_abonado, "saldo_pendiente": nuevo_saldo,
+            "total_recibido": round(amount + recargo, 2), "recargo": recargo, "estado": estado}
+    except HTTPException:
+        if conn: conn.rollback()
+        raise
+    except Exception as exc:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=f"No se pudo registrar el abono: {str(exc)}")
+    finally:
+        if conn: conn.close()
+
 
 @app.put("/admin/cuota/pagar")
 def marcar_cuota_pagada(
