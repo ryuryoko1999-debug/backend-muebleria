@@ -73,6 +73,15 @@ class PagoCuota(BaseModel):
     fecha_pago: Optional[str] = None
 
 
+
+
+class EditarFechaPago(BaseModel):
+    cliente_id: int
+    numero: str
+    detalle_mueble: str
+    vencimiento: str
+    nueva_fecha_pago: str
+
 class EditarVencimiento(BaseModel):
     cliente_id: int
     numero: str
@@ -820,6 +829,70 @@ def marcar_cuota_pagada(
         if conn:
             conn.close()
 
+
+
+
+@app.put("/admin/cuota/editar-fecha-pago")
+def editar_fecha_pago(
+    datos: EditarFechaPago,
+    authorization: str | None = Header(default=None),
+):
+    comprobar_admin_token(authorization)
+    try:
+        fecha = parsear_fecha(datos.nueva_fecha_pago).strftime("%d/%m/%Y")
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="La fecha de pago no es válida.")
+
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM cuotas
+                WHERE cliente_id = %s
+                  AND numero = %s
+                  AND detalle_mueble = %s
+                  AND vencimiento = %s
+                  AND LOWER(COALESCE(estado, '')) IN ('pagado', 'pago', 'paid')
+                """,
+                (datos.cliente_id, datos.numero.strip(),
+                 datos.detalle_mueble.strip(), datos.vencimiento.strip()),
+            )
+            cantidad = cur.fetchone()[0]
+            if cantidad == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No se encontró una cuota pagada con esos datos.",
+                )
+            if cantidad > 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Hay más de una cuota que coincide. No se modificó ninguna.",
+                )
+            cur.execute(
+                """
+                UPDATE cuotas SET fecha_pago = %s
+                WHERE cliente_id = %s AND numero = %s
+                  AND detalle_mueble = %s AND vencimiento = %s
+                """,
+                (fecha, datos.cliente_id, datos.numero.strip(),
+                 datos.detalle_mueble.strip(), datos.vencimiento.strip()),
+            )
+        conn.commit()
+        return {"ok": True, "mensaje": "Fecha de pago actualizada correctamente.", "fecha_pago": fecha}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as exc:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"No se pudo actualizar la fecha de pago: {str(exc)}")
+    finally:
+        if conn:
+            conn.close()
 
 # ============================================================
 # ADMIN - EDITAR FECHA DE VENCIMIENTO
