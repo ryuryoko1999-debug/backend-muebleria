@@ -568,8 +568,10 @@ def listar_cuotas_cliente(
                     estado,
                     fecha_pago,
                     COALESCE((SELECT SUM(p.monto_abono) FROM pagos_cuotas p
-                        WHERE p.cliente_id = cuotas.cliente_id AND p.numero = cuotas.numero
-                        AND p.detalle_mueble = cuotas.detalle_mueble AND p.vencimiento = cuotas.vencimiento), 0) AS monto_abonado
+                        WHERE p.cliente_id::text = cuotas.cliente_id::text
+                        AND p.numero::text = cuotas.numero::text
+                        AND p.detalle_mueble::text = cuotas.detalle_mueble::text
+                        AND p.vencimiento::text = cuotas.vencimiento::text), 0) AS monto_abonado
                 FROM cuotas
                 WHERE cliente_id = %s
                 ORDER BY detalle_mueble, numero
@@ -596,10 +598,11 @@ def listar_cuotas_cliente(
             for row in filas
         ]
 
-    except Exception:
+    except Exception as exc:
+        print(f"Error al listar cuotas del cliente {cliente_id}: {exc}")
         raise HTTPException(
             status_code=500,
-            detail="No se pudieron obtener las cuotas.",
+            detail="No se pudieron obtener las cuotas. Revisá los logs del backend para ver el error exacto.",
         )
     finally:
         if conn:
